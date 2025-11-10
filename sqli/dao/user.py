@@ -1,7 +1,7 @@
-from hashlib import md5
 from typing import NamedTuple, Optional
-
 from aiopg import Connection
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 
 class User(NamedTuple):
@@ -37,5 +37,48 @@ class User(NamedTuple):
             )
             return User.from_raw(await cur.fetchone())
 
-    def check_password(self, password: str):
-        return self.pwd_hash == md5(password.encode('utf-8')).hexdigest()
+    def check_password(self, password: str) -> bool:
+        """
+        Verify password using Argon2 password hashing.
+        
+        Args:
+            password: Plain text password to verify
+            
+        Returns:
+            True if password matches, False otherwise
+        """
+        ph = PasswordHasher()
+        try:
+            ph.verify(self.pwd_hash, password)
+            return True
+        except VerifyMismatchError:
+            return False
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """
+        Hash a password for secure storage using Argon2.
+        
+        Args:
+            password: Plain text password to hash
+            
+        Returns:
+            Hashed password string safe for database storage
+        """
+        ph = PasswordHasher()
+        return ph.hash(password)
+
+    async def update_password(self, conn: Connection, new_password: str) -> None:
+        """
+        Update user's password in the database.
+        
+        Args:
+            conn: Database connection
+            new_password: New plain text password to set
+        """
+        new_hash = self.hash_password(new_password)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                'UPDATE users SET pwd_hash = %s WHERE id = %s',
+                (new_hash, self.id),
+            )

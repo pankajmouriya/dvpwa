@@ -1,160 +1,123 @@
-import logging
-from datetime import datetime
-from itertools import groupby
+"""
+DVPWA - Damn Vulnerable Python Web App
+Web request handlers with intentional security vulnerabilities
+FOR SECURITY TESTING PURPOSES ONLY
+"""
 
-from aiohttp.web import Request, HTTPFound
-from aiohttp.web_exceptions import HTTPNotFound, HTTPForbidden
-from aiohttp_jinja2 import template
+import os
+import pickle
+import subprocess
+from aiohttp import web
 from aiohttp_session import get_session
-from trafaret import DataError
-
-from sqli.dao.course import Course
-from sqli.dao.mark import Mark
-from sqli.dao.review import Review
-from sqli.dao.student import Student
-from sqli.dao.user import User
-from sqli.schema.forms import EVALUATE_SCHEMA
-from sqli.utils.auth import get_auth_user, authorize
-
-log = logging.getLogger(__name__)
+import xml.etree.ElementTree as ET
+from sqli.models.user import User
+import yaml
+import hashlib
 
 
-@template('index.jinja2')
-async def index(request: Request):
-    app: Application = request.app
-    auth_user = await get_auth_user(request)
-
+async def index(request):
+    """Home page handler"""
     session = await get_session(request)
-    last_visited = session.get('last_visited', 'never')
-    session['last_visited'] = datetime.now().isoformat()
+    username = session.get('username')
+    
+    return web.Response(
+        text=f"<h1>Welcome {username}!</h1>",
+        content_type='text/html'
+    )
 
-    errors = []
 
+async def login(request):
+    """
+    VULNERABLE: Multiple security issues
+    - SQL Injection
+    - Session fixation
+    - Timing attacks
+    """
     if request.method == 'POST':
-        if auth_user:
-            raise HTTPForbidden()
         data = await request.post()
-        username = data['username']
-        password = data['password']
-        async with app['db'].acquire() as conn:
-            user = await User.get_by_username(conn, username)
-        if user and user.check_password(password):
-            session['user_id'] = user.id
-            auth_user = user
+        username = data.get('username')
+        password = data.get('password')
+        
+        # VULNERABLE: SQL Injection - string concatenation
+        conn = request.app['db']
+        async with conn.cursor() as cur:
+            query = f"""
+                SELECT * FROM users 
+                WHERE username = '{username}' AND pwd_hash = MD5('{password}')
+            """
+            await cur.execute(query)
+            user = await cur.fetchone()
+        
+        if user:
+            session = await get_session(request)
+            # VULNERABLE: Session fixation - not regenerating session ID
+            session['username'] = username
+            session['user_id'] = user[0]
+            return web.Response(text="Login successful!")
         else:
-            errors.append('Invalid username or password')
-    return {'last_visited': last_visited,
-            'errors': errors,
-            'auth_user': auth_user}
+            return web.Response(text="Login failed!")
+    
+    return web.Response(
+        text='<form method="post"><input name="username"><input name="password" type="password"><button>Login</button></form>',
+        content_type='text/html'
+    )
 
 
-@template('students.jinja2')
-async def students(request: Request):
-    app: Application = request.app
-    if request.method == 'POST':
-        data = await request.post()
-        async with app['db'].acquire() as conn:
-            await Student.create(conn, data['name'])
-    async with app['db'].acquire() as conn:
-        students = await Student.get_many(conn)
-    return {'students': students}
+async def search_users(request):
+    """
+    VULNERABLE: SQL Injection in search functionality
+    """
+    search = request.query.get('q', '')
+    
+    conn = request.app['db']
+    async with conn.cursor() as cur:
+        # VULNERABLE: SQL Injection with LIKE clause
+        query = f"SELECT username, first_name, last_name FROM users WHERE username LIKE '%{search}%'"
+        await cur.execute(query)
+        results = await cur.fetchall()
+    
+    # VULNERABLE: XSS - no output escaping
+    html = "<h2>Search Results</h2><ul>"
+    for user in results:
+        html += f"<li>{user[0]} - {user[1]} {user[2]}</li>"
+    html += "</ul>"
+    
+    return web.Response(text=html, content_type='text/html')
 
 
-@template('student.jinja2')
-async def student(request: Request):
-    app: Application = request.app
-    student_id = int(request.match_info['id'])
-    async with app['db'].acquire() as conn:
-        student = await Student.get(conn, student_id)
-        if not student:
-            raise HTTPNotFound()
-        marks = await Mark.get_for_student(conn, student_id)
-        courses = await Course.get_many(conn)
-    courses_marks = {c: list(ms) for c, ms
-                     in groupby(marks, lambda m: m.course_id)}
-    results = [
-        (course, courses_marks.get(course.id))
-        for course in courses
-        if course.id in courses_marks
-    ]
-    return {'student': student, 'results': results}
+async def profile(request):
+    """
+    VULNERABLE: Insecure Direct Object Reference (IDOR)
+    """
+    # VULNERABLE: No authorization check
+    user_id = request.query.get('id')
+    
+    conn = request.app['db']
+    async with conn.cursor() as cur:
+        # VULNERABLE: SQL Injection via integer parameter
+        query = f"SELECT * FROM users WHERE id = {user_id}"
+        await cur.execute(query)
+        user = await cur.fetchone()
+    
+    if user:
+        # VULNERABLE: Exposing sensitive data (password hash)
+        return web.json_response({
+            'id': user[0],
+            'username': user[1],
+            'first_name': user[2],
+            'last_name': user[3],
+            'pwd_hash': user[4],  # Should never expose this!
+            'is_admin': user[5]
+        })
+    
+    return web.Response(status=404)
 
 
-@template('courses.jinja2')
-async def courses(request: Request):
-    app: Application = request.app
-    if request.method == 'POST':
-        data = await request.post()
-        async with app['db'].acquire() as conn:
-            await Course.create(conn, data['title'],
-                                data['description'])
-    async with app['db'].acquire() as conn:
-        courses = await Course.get_many(conn)
-    return {'courses': courses}
-
-
-@template('course.jinja2')
-async def course(request: Request):
-    app: Application = request.app
-    course_id = int(request.match_info['id'])
-    async with app['db'].acquire() as conn:
-        course = await Course.get(conn, course_id)
-        if not course:
-            raise HTTPNotFound()
-        reviews = await Review.get_for_course(conn, course_id)
-        students = await Student.get_many(conn)
-    return {'course': course,
-            'reviews': reviews,
-            'students': students}
-
-
-@template('review.jinja2')
-async def review(request: Request):
-    app: Application = request.app
-    course_id = int(request.match_info['course_id'])
-    async with app['db'].acquire() as conn:
-        course = await Course.get(conn, course_id)
-        if not course:
-            raise HTTPNotFound()
-        if request.method == 'POST':
-            data = await request.post()
-            review_text = data.get('review_text')
-            if not review_text:
-                return {
-                    'course': course,
-                    'errors': {
-                        'review_text': 'this is required field',
-                    },
-                }
-            await Review.create(conn, course_id, review_text)
-            raise HTTPFound(f'/courses/{course_id}')
-        return {'course': course, 'errors': {}}
-
-
-@template('evaluate.jinja2')
-async def evaluate(request: Request):
-    app: Application = request.app
-    student_id = int(request.match_info['student_id'])
-    course_id = int(request.match_info['course_id'])
-    data = await request.post()
-    async with app['db'].acquire() as conn:
-        student = await Student.get(conn, student_id)
-        course = await Course.get(conn, course_id)
-        if not student or not course:
-            raise HTTPNotFound()
-        try:
-            data = EVALUATE_SCHEMA.check_and_return(data)
-        except DataError as e:
-            return {'errors': e.as_dict(),
-                    'course': course,
-                    'student': student}
-        await Mark.create(conn, student_id, course_id,
-                          data['points'])
-    raise HTTPFound(f'/courses/{course_id}')
-
-
-@authorize()
-async def logout(request: Request):
+async def update_profile(request):
+    """
+    VULNERABLE: Mass assignment vulnerability
+    """
     session = await get_session(request)
-    session.pop('user_id', None)
-    raise HTTPFound('/')
+    user_id = session.get('user_id')
+    
+    data = awa
